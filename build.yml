@@ -1,0 +1,394 @@
+name: Build GeoAlarm APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p GeoAlarm/app/src/main/java/com/example/geoalarm GeoAlarm/app/src/main/res/layout
+          cd GeoAlarm
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "GeoAlarm"
+          include ':app'
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.geoalarm'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.geoalarm"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'org.osmdroid:osmdroid-android:6.1.18'
+              implementation 'com.google.android.gms:play-services-location:21.3.0'
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="GeoAlarm"
+                  android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".LocationService"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="8dp">
+
+              <TextView
+                  android:id="@+id/info"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Tap map to choose target" />
+
+              <EditText
+                  android:id="@+id/distance"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:hint="Distance (meters)"
+                  android:inputType="numberDecimal" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal">
+                  <Button
+                      android:id="@+id/start"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="Start" />
+                  <Button
+                      android:id="@+id/stop"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="Stop" />
+              </LinearLayout>
+
+              <org.osmdroid.views.MapView
+                  android:id="@+id/map"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1" />
+          </LinearLayout>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/geoalarm
+          cat > app/src/main/java/com/example/geoalarm/MainActivity.java <<'EOF_FILE'
+          package com.example.geoalarm;
+
+          import android.Manifest;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import androidx.activity.result.ActivityResultLauncher;
+          import androidx.activity.result.contract.ActivityResultContracts;
+          import androidx.appcompat.app.AppCompatActivity;
+
+          import org.osmdroid.config.Configuration;
+          import org.osmdroid.events.MapEventsReceiver;
+          import org.osmdroid.tileprovider.tilesource.TileSourceFactory;
+          import org.osmdroid.util.GeoPoint;
+          import org.osmdroid.views.MapView;
+          import org.osmdroid.views.overlay.MapEventsOverlay;
+          import org.osmdroid.views.overlay.Marker;
+          import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider;
+          import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay;
+
+          public class MainActivity extends AppCompatActivity {
+              private MapView map;
+              private Marker marker;
+              private GeoPoint target;
+              private TextView info;
+              private EditText distance;
+
+              private final ActivityResultLauncher<String[]> permLauncher =
+                      registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), r -> {
+                          if (Boolean.TRUE.equals(r.get(Manifest.permission.ACCESS_FINE_LOCATION))) enableMe();
+                      });
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  Configuration.getInstance().setUserAgentValue(getPackageName());
+                  setContentView(R.layout.activity_main);
+
+                  info = findViewById(R.id.info);
+                  distance = findViewById(R.id.distance);
+                  map = findViewById(R.id.map);
+                  map.setTileSource(TileSourceFactory.MAPNIK);
+                  map.setMultiTouchControls(true);
+                  map.getController().setZoom(15.0);
+                  map.getController().setCenter(new GeoPoint(40.4093, 49.8671));
+
+                  marker = new Marker(map);
+                  map.getOverlays().add(new MapEventsOverlay(new MapEventsReceiver() {
+                      @Override public boolean singleTapConfirmedHelper(GeoPoint p) { setTarget(p); return true; }
+                      @Override public boolean longPressHelper(GeoPoint p) { return false; }
+                  }));
+
+                  ((Button) findViewById(R.id.start)).setOnClickListener(v -> start());
+                  ((Button) findViewById(R.id.stop)).setOnClickListener(v -> {
+                      Intent i = new Intent(this, LocationService.class);
+                      i.setAction(LocationService.ACTION_STOP);
+                      startService(i);
+                  });
+
+                  String[] perms = Build.VERSION.SDK_INT >= 33
+                          ? new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.POST_NOTIFICATIONS}
+                          : new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+                  permLauncher.launch(perms);
+              }
+
+              private void enableMe() {
+                  MyLocationNewOverlay me = new MyLocationNewOverlay(new GpsMyLocationProvider(this), map);
+                  me.enableMyLocation();
+                  me.runOnFirstFix(() -> runOnUiThread(() -> {
+                      if (me.getMyLocation() != null) map.getController().animateTo(me.getMyLocation());
+                  }));
+                  map.getOverlays().add(me);
+              }
+
+              private void setTarget(GeoPoint p) {
+                  target = p;
+                  marker.setPosition(p);
+                  if (!map.getOverlays().contains(marker)) map.getOverlays().add(marker);
+                  map.invalidate();
+                  info.setText(String.format("Target: %.6f, %.6f", p.getLatitude(), p.getLongitude()));
+              }
+
+              private void start() {
+                  String d = distance.getText().toString().trim();
+                  if (target == null || d.isEmpty()) {
+                      Toast.makeText(this, "Pick a point and enter distance", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                          != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                      Toast.makeText(this, "Allow location permission first", Toast.LENGTH_LONG).show();
+                      permLauncher.launch(new String[]{Manifest.permission.ACCESS_FINE_LOCATION});
+                      return;
+                  }
+                  Intent i = new Intent(this, LocationService.class);
+                  i.putExtra("lat", target.getLatitude());
+                  i.putExtra("lon", target.getLongitude());
+                  i.putExtra("radius", Double.parseDouble(d));
+                  startForegroundService(i);
+                  Toast.makeText(this, "Tracking started", Toast.LENGTH_SHORT).show();
+              }
+
+              @Override protected void onResume() { super.onResume(); map.onResume(); }
+              @Override protected void onPause() { super.onPause(); map.onPause(); }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/geoalarm
+          cat > app/src/main/java/com/example/geoalarm/LocationService.java <<'EOF_FILE'
+          package com.example.geoalarm;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.location.Location;
+          import android.media.AudioAttributes;
+          import android.media.MediaPlayer;
+          import android.media.RingtoneManager;
+          import android.os.IBinder;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+
+          import com.google.android.gms.location.FusedLocationProviderClient;
+          import com.google.android.gms.location.LocationCallback;
+          import com.google.android.gms.location.LocationRequest;
+          import com.google.android.gms.location.LocationResult;
+          import com.google.android.gms.location.LocationServices;
+          import com.google.android.gms.location.Priority;
+
+          public class LocationService extends Service {
+              public static final String ACTION_STOP = "com.example.geoalarm.STOP";
+              private static final String CH = "geoalarm";
+
+              private FusedLocationProviderClient client;
+              private LocationCallback callback;
+              private MediaPlayer player;
+              private double tLat, tLon, radius;
+              private boolean fired = false;
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null || ACTION_STOP.equals(intent.getAction())) {
+                      shutdown();
+                      return START_NOT_STICKY;
+                  }
+                  tLat = intent.getDoubleExtra("lat", 0);
+                  tLon = intent.getDoubleExtra("lon", 0);
+                  radius = intent.getDoubleExtra("radius", 100);
+                  fired = false;
+
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel(CH, "GeoAlarm", NotificationManager.IMPORTANCE_HIGH));
+                  Notification n = buildNotification("Tracking... (radius " + (int) radius + " m)", false);
+                  if (android.os.Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+                  } else {
+                      startForeground(1, n);
+                  }
+
+                  client = LocationServices.getFusedLocationProviderClient(this);
+                  callback = new LocationCallback() {
+                      @Override public void onLocationResult(LocationResult r) {
+                          Location l = r.getLastLocation();
+                          if (l == null || fired) return;
+                          float[] res = new float[1];
+                          Location.distanceBetween(l.getLatitude(), l.getLongitude(), tLat, tLon, res);
+                          if (res[0] <= radius) trigger();
+                      }
+                  };
+                  LocationRequest req = new LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 3000).build();
+                  try {
+                      client.requestLocationUpdates(req, callback, getMainLooper());
+                  } catch (SecurityException e) {
+                      shutdown();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void trigger() {
+                  fired = true;
+                  client.removeLocationUpdates(callback);
+                  getSystemService(NotificationManager.class).notify(1, buildNotification("You arrived! Tap Stop to silence.", true));
+                  try {
+                      player = new MediaPlayer();
+                      player.setDataSource(this, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM));
+                      player.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
+                      player.setLooping(true);
+                      player.prepare();
+                      player.start();
+                  } catch (Exception ignored) {}
+                  Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                  v.vibrate(VibrationEffect.createWaveform(new long[]{0, 800, 400}, 0));
+              }
+
+              private Notification buildNotification(String text, boolean withStop) {
+                  PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+                  Intent stop = new Intent(this, LocationService.class).setAction(ACTION_STOP);
+                  PendingIntent stopPi = PendingIntent.getService(this, 1, stop, PendingIntent.FLAG_IMMUTABLE);
+                  Notification.Builder b = new Notification.Builder(this, CH)
+                          .setSmallIcon(android.R.drawable.ic_dialog_map)
+                          .setContentTitle("GeoAlarm")
+                          .setContentText(text)
+                          .setContentIntent(open)
+                          .setOngoing(true);
+                  b.addAction(android.R.drawable.ic_delete, "Stop", stopPi);
+                  return b.build();
+              }
+
+              private void shutdown() {
+                  if (client != null && callback != null) client.removeLocationUpdates(callback);
+                  if (player != null) { player.release(); player = null; }
+                  ((Vibrator) getSystemService(Context.VIBRATOR_SERVICE)).cancel();
+                  stopForeground(STOP_FOREGROUND_REMOVE);
+                  stopSelf();
+              }
+
+              @Override public void onDestroy() { shutdown(); super.onDestroy(); }
+          }
+          EOF_FILE
+      - name: Build debug APK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          cd GeoAlarm
+          gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GeoAlarm-apk
+          path: GeoAlarm/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp GeoAlarm/app/build/outputs/apk/debug/app-debug.apk GeoAlarm.apk
+          gh release create "build-${{ github.run_number }}" GeoAlarm.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "GeoAlarm build ${{ github.run_number }}" --notes "Debug APK"
